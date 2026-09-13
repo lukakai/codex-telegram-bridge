@@ -8,7 +8,7 @@ const NETWORK_CODES=new Set([
   'CERT_HAS_EXPIRED','UNABLE_TO_VERIFY_LEAF_SIGNATURE','DEPTH_ZERO_SELF_SIGNED_CERT',
   'SELF_SIGNED_CERT_IN_CHAIN','ERR_TLS_CERT_ALTNAME_INVALID','UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
 ]);
-const DELIVERY_METHODS=new Set(['sendMessage','sendDocument','editMessageReplyMarkup','answerCallbackQuery']);
+const DELIVERY_METHODS=new Set(['sendMessage','sendDocument','sendPhoto','editMessageText','deleteMessage','editMessageReplyMarkup','answerCallbackQuery']);
 const increment=value=>Math.min(Number.MAX_SAFE_INTEGER,value+1);
 const healthState=()=>({successes:0,failures:0,consecutiveFailures:0,lastSuccessAt:null,lastFailureAt:null,lastCode:null});
 

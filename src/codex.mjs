@@ -44,7 +44,7 @@ export class CodexRpc extends EventEmitter {
     // Drain stderr without forwarding it: it may contain local paths, credentials or prompts.
     child.stderr.on('data', () => {});
     try {
-      const result=await this.rawCall('initialize', {clientInfo:{name:'codex_telegram_bridge', title:'Local Telegram Bridge', version:VERSION}, capabilities:{experimentalApi:true, requestAttestation:false}});
+      const result=await this.rawCall('initialize', {clientInfo:{name:'codex_telegram_bridge', title:'Local Telegram Bridge', version:VERSION}, capabilities:{experimentalApi:true, requestAttestation:false, mcpServerOpenaiFormElicitation:true}});
       if (this.child!==child || this.closed) throw new Error(CONNECTION_CLOSED);
       this.send({method:'initialized'}); this.generation++;
       return result;

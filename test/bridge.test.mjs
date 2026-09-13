@@ -19,8 +19,10 @@ class MockRpc extends EventEmitter {
   fail(e) {this.closed=true; this.emit('fatal',e);}
 }
 class MockTg {
-  messages=[]; clears=[]; acks=[];
+  messages=[]; clears=[]; acks=[]; edits=[]; deletes=[];
   async say(chatId,text,keyboard) {const m={message_id:this.messages.length+1,chatId,text,keyboard}; this.messages.push(m); return m;}
+  async editMessageText(chatId,id,text) {this.edits.push({chatId,id,text});const message=this.messages.find(item=>item.message_id===id);if(message)message.text=text;return message;}
+  async deleteMessage(chatId,id) {this.deletes.push({chatId,id});}
   async ack(id,text) {this.acks.push({id,text});}
   async clear(chatId,id) {this.clears.push({chatId,id});}
 }
@@ -160,13 +162,25 @@ test('completion invalidates old approvals with no late execution',async t=>{
   await f.b.notification({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'completed'}}});
   await f.b.callback(f.callback(m,m.keyboard[0][0].callback_data));assert.equal(f.rpc.replies.length,0);assert.equal(f.b.active,null);
 });
-test('completion unsubscribes then closes the temporary worker after the final status',async t=>{
+test('completion releases the temporary worker before announcing desktop availability',async t=>{
   const f=fixture(t),events=[];f.current();f.rpc.isRunning=true;
   f.rpc.handler=method=>{events.push(method);return {};};
   f.rpc.close=async()=>{events.push('close');f.rpc.isRunning=false;};
   const say=f.tg.say.bind(f.tg);f.tg.say=async(...args)=>{events.push('say');return say(...args);};
   await f.b.notification({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'completed'}}});
-  assert.deepEqual(events.slice(-3),['say','thread/unsubscribe','close']);assert.equal(f.rpc.isRunning,false);assert.equal(f.b.releasePromise,null);
+  assert.deepEqual(events.slice(-3),['thread/unsubscribe','close','say']);assert.equal(f.rpc.isRunning,false);assert.equal(f.b.releasePromise,null);
+});
+test('submitted status is edited in place after release and successful status is temporary',async t=>{
+  const f=fixture(t);f.b.selected=f.thread;f.b.managed.set(f.thread.id,f.thread);f.b.taskStatusDeleteMs=5;
+  f.rpc.isRunning=true;f.rpc.handler=method=>method==='turn/start'?{turn:{id:'turn-status'}}:{};
+  f.rpc.close=async()=>{f.rpc.isRunning=false;};
+  await f.b.startTurn('work');const status=f.tg.messages.at(-1);
+  assert.ok(status.text.includes('正在执行'));assert.equal(f.tg.messages.length,1);
+  await f.b.notification({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-status',status:'completed'}}});
+  assert.equal(f.tg.messages.length,1);assert.equal(f.tg.edits.length,1);
+  assert.ok(status.text.includes('任务已完成'));assert.ok(status.text.includes('worker 已释放'));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.deepEqual(f.tg.deletes,[{chatId:123,id:status.message_id}]);
 });
 test('unsubscribe failure cannot change a completed result and still closes the worker',async t=>{
   const f=fixture(t);f.current();f.rpc.isRunning=true;let closed=0;
@@ -279,7 +293,7 @@ test('stop denies pending and newly arriving approvals until completion',async t
 test('turn completion before start response does not restore stale active state',async t=>{
   const f=fixture(t);f.b.selected=f.thread;f.b.managed.set(f.thread.id,f.thread);
   f.rpc.handler=async()=>{await f.b.notification({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-fast',status:'completed'}}});return {turn:{id:'turn-fast'}};};
-  await f.b.startTurn('quick');assert.equal(f.b.active,null);
+  await f.b.startTurn('quick');assert.equal(f.b.active,null);assert.equal(f.tg.messages.length,1);assert.ok(f.tg.messages[0].text.includes('任务已完成'));assert.ok(!f.tg.messages[0].text.includes('正在执行'));
 });
 test('unrelated turn-start event cannot replace active turn ID',async t=>{
   const f=fixture(t);f.current();await f.b.notification({method:'turn/started',params:{threadId:'thread-1',turn:{id:'turn-foreign'}}});assert.equal(f.b.active.turnId,'turn-1');
@@ -325,4 +339,114 @@ test('crashed delivery is not automatically replayed from saved offset',async()=
   let saved;const one=new Inbox({since:100,save:s=>{saved=s;}});const update={update_id:5,message:{date:101}};
   await assert.rejects(one.dispatch(update,async()=>{throw new Error('crash');}));const two=new Inbox({offset:saved.offset,since:100,save:()=>{}});let executed=false;
   await two.dispatch(update,async()=>{executed=true;});assert.equal(executed,false);
+});
+
+test('MCP URL elicitation is shown with redacted query and accepts only Telegram confirmation',async t=>{
+  const f=fixture(t);f.current();
+  await f.b.serverRequest({id:101,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,serverName:'browser',mode:'url',url:'https://example.test/oauth?code=private-token#fragment',message:'Please continue in browser'}});
+  assert.equal(f.rpc.replies.length,0);const m=f.tg.messages.at(-1);assert.ok(m.text.includes('example.test/oauth'));assert.ok(!m.text.includes('private-token'));assert.equal(f.b.elicitations.size,1);
+  await f.b.callback(f.callback(m,m.keyboard[0][0].callback_data));
+  assert.deepEqual(f.rpc.replies,[{id:101,result:{action:'accept',content:null}}]);assert.equal(f.b.elicitations.size,0);
+});
+
+test('MCP form accepts validated JSON and rejects unknown or malformed fields',async t=>{
+  const f=fixture(t);f.current();
+  await f.b.serverRequest({id:102,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,mode:'form',serverName:'browser',message:'Choose a tab',requestedSchema:{type:'object',properties:{tab:{type:'string',enum:['one','two']}},required:['tab']}}});
+  const m=f.tg.messages.at(-1),key=[...f.b.elicitations.keys()][0];assert.ok(m.text.includes(`/mcp ${key}`));
+  await assert.rejects(f.b.mcp(`${key} {"other":"x"}`),/不允许的字段/);assert.equal(f.rpc.replies.length,0);
+  await f.b.handle(f.msg(`/mcp ${key} {"tab":"two"}`));assert.deepEqual(f.rpc.replies,[{id:102,result:{action:'accept',content:{tab:'two'}}}]);
+});
+
+test('MCP request without turnId binds to the active thread but not another thread',async t=>{
+  const f=fixture(t);f.current();
+  await f.b.serverRequest({id:103,method:'mcpServer/elicitation/request',params:{threadId:'foreign-thread',mode:'url',url:'https://example.test/start'}});
+  assert.deepEqual(f.rpc.replies,[{id:103,result:{action:'decline',content:null}}]);assert.equal(f.b.elicitations.size,0);
+  await f.b.serverRequest({id:104,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,mode:'url',url:'https://example.test/start'}});assert.equal(f.b.elicitations.size,1);
+});
+
+test('MCP resolved and completed turns clear pending requests',async t=>{
+  const f=fixture(t);f.current();
+  await f.b.serverRequest({id:105,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,mode:'url',url:'https://example.test/start'}});assert.equal(f.b.elicitations.size,1);
+  await f.b.notification({method:'serverRequest/resolved',params:{requestId:105}});assert.equal(f.b.elicitations.size,0);assert.equal(f.rpc.replies.length,0);
+  await f.b.serverRequest({id:106,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,mode:'url',url:'https://example.test/start'}});assert.equal(f.b.elicitations.size,1);
+  await f.b.notification({method:'turn/completed',params:{threadId:f.thread.id,turn:{id:'turn-1',status:'interrupted'}}});assert.equal(f.b.elicitations.size,0);
+});
+
+test('busy operation failure includes actionable guide',async t=>{
+  const f=fixture(t);f.current();await f.b.handle(f.msg('/new another task'));const text=f.tg.messages.at(-1).text;
+  assert.ok(text.includes('操作未完成'));assert.ok(text.includes('/status'));assert.ok(text.includes('/stop'));assert.ok(text.includes('/guide'));
+});
+
+const mcpRequest=(f,id=200,extra={})=>({id,method:'mcpServer/elicitation/request',params:{threadId:f.thread.id,turnId:null,mode:'form',serverName:'computer-use',message:'Allow Chrome access?',requestedSchema:{type:'object',properties:{}},...extra}});
+
+test('MCP confirmation supports all form modes with paired-user, message and single-use binding',async t=>{
+  for(const mode of ['form','openai/form','openaiForm']) {
+    const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,200,{mode}));
+    const m=f.tg.messages.at(-1),data=m.keyboard[0][0].callback_data;
+    await f.b.callback(f.callback(m,data,999));await f.b.callback(f.callback({...m,message_id:99999},data));assert.equal(f.rpc.replies.length,0);
+    await f.b.callback(f.callback(m,data));await f.b.callback(f.callback(m,data));
+    assert.deepEqual(f.rpc.replies,[{id:200,result:{action:'accept',content:{}}}]);
+  }
+});
+test('MCP boolean fields offer explicit values and never guess required permission',async t=>{
+  const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,201,{requestedSchema:{type:'object',properties:{allow:{type:'boolean'}},required:['allow']}}));
+  const m=f.tg.messages.at(-1),key=[...f.b.elicitations.keys()][0];await f.b.mcp(`${key} yes`);assert.equal(f.rpc.replies.length,0);
+  const choice=m.keyboard.flat().find(button=>button.text==='allow: true');await f.b.callback(f.callback(m,choice.callback_data));
+  assert.deepEqual(f.rpc.replies,[{id:201,result:{action:'accept',content:{allow:true}}}]);
+});
+test('MCP form help preserves rejection buttons; cancel does not claim to interrupt the whole turn',async t=>{
+  for(const [index,action] of [[1,'decline'],[2,'cancel']]) {
+    const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,202,{requestedSchema:{type:'object',properties:{note:{type:'string'}},required:['note']}}));
+    const m=f.tg.messages.at(-1);await f.b.callback(f.callback(m,m.keyboard[0][0].callback_data));assert.equal(f.rpc.replies.length,0);assert.equal(f.tg.clears.length,0);
+    await f.b.callback(f.callback(m,m.keyboard[0][index].callback_data));assert.deepEqual(f.rpc.replies,[{id:202,result:{action,content:null}}]);assert.ok(f.b.active);
+  }
+});
+test('MCP malformed JSON reports guidance without losing the pending request',async t=>{
+  const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f));const key=[...f.b.elicitations.keys()][0];
+  await f.b.handle(f.msg(`/mcp ${key} {bad`));assert.ok(f.tg.messages.at(-1).text.includes('JSON 无效'));assert.equal(f.rpc.replies.length,0);assert.equal(f.b.elicitations.size,1);
+});
+test('MCP default values must satisfy field type, range and string constraints',async t=>{
+  for(const field of [{type:'boolean',default:'yes'},{type:'integer',minimum:1,default:0},{type:'string',maxLength:2,default:'long'},{type:'string',pattern:'^safe$',default:'unsafe'}]) {
+    const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,203,{requestedSchema:{type:'object',properties:{value:field}}}));
+    assert.deepEqual(f.rpc.replies,[{id:203,result:{action:'decline',content:null}}]);assert.equal(f.b.elicitations.size,0);assert.ok(f.tg.messages.every(m=>!m.keyboard));
+  }
+});
+test('MCP sensitive schemas, unsupported nested values and prototype keys fail closed',async t=>{
+  for(const properties of [{password:{type:'string',default:'DO_NOT_FORWARD'}},{value:{type:'object'}},JSON.parse('{"__proto__":{"type":"boolean"}}')]) {
+    const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,204,{message:'PRIVATE_PROMPT',requestedSchema:{type:'object',properties}}));
+    assert.equal(f.rpc.replies[0].result.action,'decline');assert.ok(!f.tg.messages.some(m=>m.text.includes('DO_NOT_FORWARD')||m.text.includes('PRIVATE_PROMPT')));
+  }
+});
+test('MCP invalid URLs never offer acceptance and URLs inside descriptions are redacted',async t=>{
+  for(const url of ['javascript:alert(1)','file:///private/file','https://name:private@example.test/path']) {
+    const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,205,{mode:'url',url}));assert.equal(f.rpc.replies[0].result.action,'decline');assert.ok(f.tg.messages.every(m=>!m.keyboard));
+  }
+  const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,206,{message:'Visit https://example.test/start?code=HIDDEN#secret'}));
+  assert.ok(!f.tg.messages.some(m=>m.text.includes('HIDDEN')));
+});
+test('MCP expiry rejects a decision after clock advance and stop invalidates missing-turn requests',async t=>{
+  const f=fixture(t);f.current();await f.b.serverRequest(mcpRequest(f,207));const key=[...f.b.elicitations.keys()][0];f.clock.time+=601000;
+  await f.b.handle(f.msg(`/mcp ${key} yes`));assert.equal(f.b.elicitations.size,0);assert.equal(f.rpc.replies[0].result.action,'decline');
+  await f.b.serverRequest(mcpRequest(f,208));await f.b.stop();assert.equal(f.b.elicitations.size,0);assert.equal(f.rpc.replies[1].result.action,'decline');
+});
+test('MCP delivery races with resolution and failure cannot leave usable authorization',async t=>{
+  const f=fixture(t);f.current();let resolveSend;
+  f.tg.say=()=>new Promise(resolve=>{resolveSend=resolve;});const request=mcpRequest(f,209),pending=f.b.serverRequest(request);
+  await new Promise(resolve=>setImmediate(resolve));await f.b.notification({method:'serverRequest/resolved',params:{requestId:209}});
+  resolveSend({message_id:777});await pending;assert.equal(f.b.elicitations.size,0);assert.equal(f.b.buttons.size,0);assert.equal(f.rpc.replies.length,0);
+  const g=fixture(t);g.current();g.tg.say=async()=>{throw new Error('offline');};const failed=mcpRequest(g,210);
+  await assert.rejects(g.b.serverRequest(failed),/offline/);g.b.deny(failed);assert.deepEqual(g.rpc.replies,[{id:210,result:{action:'decline',content:null}}]);assert.equal(g.b.buttons.size,0);
+});
+test('MCP ID reuse in a new worker is allowed but duplicate requests in one worker are ignored',async t=>{
+  const f=fixture(t);f.current();f.rpc.generation=1;await f.b.serverRequest(mcpRequest(f,1));await f.b.serverRequest(mcpRequest(f,1));assert.equal(f.b.elicitations.size,1);
+  f.b.invalidateTurn(f.thread.id,'turn-1');f.b.active={threadId:f.thread.id,turnId:'turn-2'};f.rpc.generation=2;
+  await f.b.serverRequest(mcpRequest(f,1));assert.equal(f.b.elicitations.size,1);
+});
+test('guide distinguishes no selection, preview, running, pending interactions and disconnection',async t=>{
+  const f=fixture(t);await f.b.handle(f.msg('/guide'));assert.ok(f.tg.messages.at(-1).text.includes('/new'));
+  f.b.previewed={id:f.thread.id};await f.b.guide();assert.ok(f.tg.messages.at(-1).text.includes('只是预览'));
+  f.current();await f.b.serverRequest(f.request());await f.b.serverRequest(mcpRequest(f));
+  await f.b.serverRequest({id:211,method:'item/tool/requestUserInput',params:{threadId:f.thread.id,turnId:'turn-1',questions:[{id:'q',question:'Continue?'}]}});
+  await f.b.guide();const text=f.tg.messages.at(-1).text;for(const command of ['/stop','/status','/answer','/mcp']) assert.ok(text.includes(command));
+  f.b.broken=true;await f.b.guide();assert.ok(f.tg.messages.at(-1).text.includes('重启'));
 });

@@ -6,12 +6,16 @@ import { DirectoryGrants, remoteCandidate, revalidateCandidate, requiredCommandD
 import { allowedThread, canonicalTarget, chunks, nonce, safeError, within } from './util.mjs';
 import { incomingAttachment, saveAttachment, describeExport, readExport, imageKind } from './attachments.mjs';
 import { DesktopTakeover } from './desktop-takeover.mjs';
+import { PendingMessages } from './pending-messages.mjs';
 
 const HELP = `Codex · Telegram 本地桥接\n\n/projects 选择已授权项目\n/approval 切换严格审批/自动审查\n/permissions 查看目录授权\n/allow 完整目录 申请新增目录授权\n/revoke 授权代号 撤销TG新增授权\n/threads [关键词] 查看项目及子目录历史\n/archived [关键词] 查看归档历史（只读）\n/history [会话ID] 查看最近对话\n/use <会话ID> 选择旧会话\n/new <任务描述> 在当前项目新建任务\n/model 选择模型（可直接 /model 模型ID）\n/effort 选择推理强度（可直接 /effort 强度）\n/status 当前会话、模型、任务、待审批\n/release 释放 TG 自己持有的临时 writer\n/stop 请求中止当前任务\n/answer <问题编号> <回答> 回答 Codex 提问\n\n选定会话后，可直接发文字、图片或单个文件（最大 20 MB）。文件 caption 就是任务说明；Codex 产生或更新的文件会在任务结束时直接发回。同一时间只运行一个 TG 任务。平时只读历史、不持有 writer；任务执行时临时恢复会话，结束后立即释放。桌面 writer 占用时会提供经二次确认的强制接管入口。`;
 const CMD='item/commandExecution/requestApproval';
 const FILE='item/fileChange/requestApproval';
 const INPUT='item/tool/requestUserInput';
 const PERMISSION='item/permissions/requestApproval';
+const MCP='mcpServer/elicitation/request';
+const TASK_STATUS_DELETE_MS=30_000;
+const HELP_EXTRA='\n/mcp <请求编号> yes|no|cancel|JSON 响应 MCP 请求\n/guide 当前操作说明\n/pending 查看待办、立即引导或排队';
 
 function documentInput(caption,file) {
   const instruction=caption||'请查看这个文件。';
@@ -38,6 +42,86 @@ function directiveAttribute(source,name) {
 function safeDirectiveText(value,limit) {
   if(typeof value!=='string') return '';
   return value.replace(/[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/gu,' ').trim().slice(0,limit);
+}
+
+// MCP elicitation text comes from an external server.  Keep it literal,
+// bounded, and free of control characters before showing it in Telegram.
+function safeMcpText(value,limit=1200) {
+  // URLs may also occur in descriptions, not just params.url.
+  return safeDirectiveText(value,limit).replace(/https?:\/\/[^\s<>"']+/giu,safeMcpUrl);
+}
+
+function safeMcpUrl(value) {
+  if(typeof value!=='string' || value.length>4096) return '（URL 无法安全展示）';
+  try {
+    const url=new URL(value);
+    if(!['http:','https:'].includes(url.protocol) || url.username || url.password) return '（URL 无法安全展示）';
+    return `${url.origin}${url.pathname}${url.search||url.hash?'（查询参数/片段已隐藏）':''}`;
+  } catch { return '（URL 无法安全展示）'; }
+}
+
+function primitiveValue(value) {
+  return value===null || typeof value==='boolean' || typeof value==='string' || typeof value==='number' && Number.isFinite(value);
+}
+
+function mcpSchemaInfo(schema) {
+  const root=schema && typeof schema==='object' && !Array.isArray(schema)?schema:null;
+  if(!root || (root.type!==undefined && root.type!=='object')) return {error:'表单结构不是受支持的 object schema。'};
+  if(Object.keys(root).some(key=>!['type','properties','required','additionalProperties','title','description','$schema'].includes(key))) return {error:'表单包含暂不支持的校验规则，请在 Mac 处理。'};
+  if(root.required!==undefined && (!Array.isArray(root.required) || root.required.some(name=>typeof name!=='string'))) return {error:'表单 required 格式无效。'};
+  if(root.additionalProperties!==undefined && typeof root.additionalProperties!=='boolean') return {error:'表单附加字段规则暂不支持。'};
+  const properties=root.properties===undefined?{}:root.properties;
+  if(!properties || typeof properties!=='object' || Array.isArray(properties) || Object.keys(properties).length>20) return {error:'表单字段过多或结构无效。'};
+  const required=new Set(Array.isArray(root.required)?root.required.filter(value=>typeof value==='string'):[]);
+  if([...required].some(name=>!Object.hasOwn(properties,name))) return {error:'表单 required 字段不存在。'};
+  const fields=[];
+  for(const [name,raw] of Object.entries(properties)) {
+    if(!/^[\p{L}\p{N}_.-]{1,80}$/u.test(name) || ['__proto__','constructor','prototype'].includes(name)) return {error:'表单字段名包含不安全字符。'};
+    const field=raw && typeof raw==='object' && !Array.isArray(raw)?raw:null;
+    const type=field?.type;
+    if(!field || !['boolean','string','number','integer'].includes(type)) return {error:`字段 ${name} 不是受支持的基础类型。`};
+    if(field.writeOnly===true || field.format==='password' || field.isSecret===true || /(password|token|secret|api[_. -]?key|private[_. -]?key|密码|密钥|口令)/iu.test(name+' '+(field.title||''))) return {error:'表单包含敏感字段，请在 Mac 处理。'};
+    if(Object.keys(field).some(key=>!['type','title','description','enum','default','minimum','maximum','minLength','maxLength'].includes(key))) return {error:`字段 ${name} 包含暂不支持的规则，请在 Mac 处理。`};
+    const choices=field.enum;
+    if(choices!==undefined && (!Array.isArray(choices) || choices.length>50 || choices.some(value=>!primitiveValue(value)))) return {error:`字段 ${name} 的选项不安全。`};
+    if(field.default!==undefined && (!primitiveValue(field.default) || field.default===null || choices && !choices.some(value=>Object.is(value,field.default)))) return {error:`字段 ${name} 的默认值无效。`};
+    for(const bound of ['minLength','maxLength']) if(field[bound]!==undefined && (!Number.isSafeInteger(field[bound]) || field[bound]<0)) return {error:`字段 ${name} 的长度限制无效。`};
+    if(['number','integer'].includes(type)) {
+      for(const bound of ['minimum','maximum']) if(field[bound]!==undefined && (!Number.isFinite(field[bound]) || type==='integer' && !Number.isInteger(field[bound]))) return {error:`字段 ${name} 的数值范围无效。`};
+      if(field.minimum!==undefined && field.maximum!==undefined && field.minimum>field.maximum) return {error:`字段 ${name} 的数值范围无效。`};
+    }
+    if((field.description?.length||0)>1000 || (field.title?.length||0)>160) return {error:'表单字段说明过长，请在 Mac 处理。'};
+    fields.push({name,type,required:required.has(name),description:safeMcpText([field.title,field.description].filter(Boolean).join('：'),1200),choices,default:field.default,minimum:field.minimum,maximum:field.maximum,minLength:field.minLength,maxLength:field.maxLength});
+    const compiled=fields.at(-1);
+    for(const value of [...(choices||[]),...(field.default===undefined?[]:[field.default])]) {
+      if(validateMcpContent({fields:[compiled]},{[name]:value}).error) return {error:`字段 ${name} 的默认值或选项无效。`};
+    }
+  }
+  return {fields,additionalProperties:false};
+}
+
+function validateMcpContent(info,value) {
+  if(!info || info.error) return {error:info?.error||'表单结构无效。'};
+  if(!value || typeof value!=='object' || Array.isArray(value)) return {error:'请提供 JSON object，例如 {"字段名":"值"}。'};
+  const allowed=new Set(info.fields.map(field=>field.name));
+  for(const key of Object.keys(value)) if(!allowed.has(key)) return {error:`不允许的字段：${key}。`};
+  const content={};
+  for(const field of info.fields) {
+    const present=Object.hasOwn(value,field.name);
+    if(!present) {
+      if(field.default===undefined) {
+        if(field.required) return {error:`缺少必填字段：${field.name}。`};
+        continue;
+      }
+    }
+    const item=present?value[field.name]:field.default;
+    if(field.type==='string' && (typeof item!=='string' || [...item].length>Math.min(field.maxLength??4000,4000) || [...item].length<(field.minLength??0) || /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/u.test(item))) return {error:`字段 ${field.name} 必须是安全的短文本。`};
+    if(field.type==='boolean' && typeof item!=='boolean') return {error:`字段 ${field.name} 必须是 true 或 false。`};
+    if(['number','integer'].includes(field.type) && (typeof item!=='number' || !Number.isFinite(item) || field.type==='integer' && !Number.isInteger(item) || field.minimum!==undefined && item<field.minimum || field.maximum!==undefined && item>field.maximum)) return {error:`字段 ${field.name} 的数值无效。`};
+    if(field.choices && !field.choices.some(choice=>Object.is(choice,item))) return {error:`字段 ${field.name} 必须使用列出的选项。`};
+    content[field.name]=item;
+  }
+  return {content};
 }
 
 function citationLabel(attributes,uploadNames) {
@@ -80,10 +164,15 @@ export class Bridge {
     this.uploadNames=new Map();
     this.sendChain=Promise.resolve(); this.broken=false; this.releasePromise=null; this.takeoverReservation=null;
     this.loadedThreadId=null; this.loadedGeneration=null;
-    this.requests=new Map(); this.settled=new WeakSet();
+    this.requests=new Map(); this.elicitations=new Map(); this.settled=new WeakSet();
+    this.pendingMessages=new PendingMessages(this); this.actionChain=Promise.resolve();
     this.threads=new ThreadCatalog(config,rpc);
     this.models=new ModelSettings(rpc,{now,preferences,savePreferences});
     this.approvalSettings=new ApprovalSettings({mode:approvalMode,save:saveApproval});
+    // One short-lived Telegram status card per turn. The submitted card is
+    // edited in place after worker release, then successful cards are removed.
+    this.taskStatusMessages=new Map(); // turnId -> {messageId, timer}
+    this.taskStatusDeleteMs=TASK_STATUS_DELETE_MS;
     // 流式输出状态管理
     this.streamingMessages=new Map(); // turnId -> {messageId, buffer, lastUpdate, throttleTimer}
     rpc.on('request', msg => { void this.serverRequest(msg).catch(e => this.requestFailed(msg,e)); });
@@ -106,6 +195,64 @@ export class Bridge {
     const task=this.sendChain.then(()=>this.tg.sendPhoto(this.config.chatId,file));
     this.sendChain=task.catch(()=>{});return task;
   }
+  editMessageText(messageId,text) {
+    const task=this.sendChain.then(()=>this.tg.editMessageText(this.config.chatId,messageId,text));
+    this.sendChain=task.catch(()=>{});return task;
+  }
+  deleteMessage(messageId) {
+    const task=this.sendChain.then(()=>this.tg.deleteMessage(this.config.chatId,messageId));
+    this.sendChain=task.catch(()=>{});return task;
+  }
+  rememberTaskStatus(turnId,message) {
+    if(typeof turnId!=='string' || !Number.isSafeInteger(message?.message_id)) return null;
+    const previous=this.taskStatusMessages.get(turnId);
+    if(previous?.timer) clearTimeout(previous.timer);
+    const record={messageId:message.message_id,timer:null};
+    this.taskStatusMessages.set(turnId,record);
+    return record;
+  }
+  async announceTaskStarted(turnId,text) {
+    const message=await this.say(text);
+    // A very fast turn can complete while sendMessage is in flight. Never
+    // leave a stale "running" card after its completion card.
+    if(this.finished.has(turnId)) {
+      if(Number.isSafeInteger(message?.message_id)) {
+        try {await this.deleteMessage(message.message_id);}
+        catch(error) {this.diagnostic('task-status-cleanup-failed',error);}
+      }
+      return;
+    }
+    this.rememberTaskStatus(turnId,message);
+  }
+  scheduleTaskStatusDelete(turnId,record) {
+    if(!record || this.taskStatusMessages.get(turnId)!==record) return;
+    record.timer=setTimeout(()=>{
+      if(this.taskStatusMessages.get(turnId)!==record) return;
+      this.taskStatusMessages.delete(turnId);
+      void this.deleteMessage(record.messageId).catch(error=>this.diagnostic('task-status-cleanup-failed',error));
+    },this.taskStatusDeleteMs);
+    record.timer.unref?.();
+  }
+  async announceTaskFinished(turn,text,{autoDelete=false}={}) {
+    let record=this.taskStatusMessages.get(turn.id);
+    if(record?.timer) {clearTimeout(record.timer);record.timer=null;}
+    if(record && typeof this.tg.editMessageText==='function') {
+      try {await this.editMessageText(record.messageId,text);}
+      catch(error) {
+        this.diagnostic('task-status-edit-failed',error);
+        try {await this.deleteMessage(record.messageId);}
+        catch(cleanupError) {this.diagnostic('task-status-cleanup-failed',cleanupError);}
+        this.taskStatusMessages.delete(turn.id);
+        record=this.rememberTaskStatus(turn.id,await this.say(text));
+      }
+    } else {
+      this.taskStatusMessages.delete(turn.id);
+      record=this.rememberTaskStatus(turn.id,await this.say(text));
+    }
+    if(!record) return;
+    if(autoDelete) this.scheduleTaskStatusDelete(turn.id,record);
+    else this.taskStatusMessages.delete(turn.id);
+  }
   async report(e) {
     // Only fixed categories/codes go to local diagnostics; never prompts/errors
     // from Codex, since those can contain private user content.
@@ -113,7 +260,9 @@ export class Bridge {
     try {
       if(e?.code==='DIRECTORY_NOT_AUTHORIZED' || e?.code==='DIRECTORY_PROTECTED') {await this.directoryProblem(e);return;}
       if(e?.code==='DESKTOP_WRITER_BUSY' || String(e?.message||'').includes('already has an active writer')) {await this.offerDesktopTakeover(e?.threadId||this.selected?.id||this.previewed?.id);return;}
-      await this.say(`操作未完成：${safeError(e,this.config.token)}`);
+      const message=`操作未完成：${safeError(e,this.config.token)}`;
+      const busy=this.active && /仍在运行|任务 ID 尚未确认|正在运行|占用中/u.test(String(e?.message||''));
+      await this.say(busy?`${message}\n刚才的操作没有执行，也没有排队。\n\n${this.guideText()}`:`${message}\n\n发送 /guide 查看下一步，/status 核对状态后再重试。`);
     }
     catch(sendError) {this.diagnostic('error-message-undelivered',sendError);}
   }
@@ -157,10 +306,43 @@ export class Bridge {
   }
   authorized(user,chat) { return user?.id===this.config.userId && chat?.id===this.config.chatId && chat?.type==='private'; }
   requireIdle() { if (this.active) throw new Error('当前任务仍在运行。请等待完成，或使用 /stop 并等到中止确认。'); }
-  async handle(update) {
-    if (update.callback_query) return this.callback(update.callback_query);
+  guideText() {
+    const lines=['操作引导：'];
+    if(this.broken) return 'Codex 连接已断开，请在 Mac 重启 Bridge。旧任务不会自动重发；/status 可以查看状态。';
+    if(this.active?.stopping) {
+      lines.push('• 已请求中止，等待“任务已中止”；/status 查看确认状态。');
+    } else if(this.active) {
+      lines.push('• 当前任务仍在运行：直接发文字成为待办，点“立即引导”纠正当前任务，或点“下一轮发送”。');
+      lines.push('• 需要停止：发送 /stop，并等待“任务已中止”后再重试。');
+      lines.push('• 查看状态：/status');
+    } else if(this.previewed?.readOnly) {
+      lines.push('• 当前预览的是归档会话，请先在 Mac 解除归档，再 /threads 选择。');
+    } else if(this.previewed && this.previewed.id!==this.selected?.id) {
+      lines.push('• 当前只是预览：点“选择此会话”，或 /threads 重新选择，确认后再发任务。');
+    } else if(!this.selected) {
+      lines.push('• 还没有选择会话：发送 /threads 选择历史，或 /new <任务描述> 新建。');
+    } else {
+      lines.push('• 可以直接发送文字、图片或文件。任务结束后 worker 会自动释放。');
+    }
+    if(this.approvals.size) lines.push(`• 有 ${this.approvals.size} 项待审批：点击消息中的“允许本次/拒绝”。`);
+    if(this.questions.size) lines.push(`• 有 ${this.questions.size} 个待回答问题：使用 /answer <问题编号> <回答>。`);
+    if(this.pendingMessages.size) lines.push(`• 有 ${this.pendingMessages.size} 条待办：/pending 查看、引导或取消。`);
+    if(this.elicitations.size) lines.push(`• 有 ${this.elicitations.size} 个待确认网页/MCP 请求：点击请求中的按钮；/mcp 查看待处理编号。`);
+    lines.push('• 完整命令：/help；再次查看本引导：/guide。');
+    return lines.join('\n');
+  }
+  guide() { return this.say(this.guideText()); }
+  enqueueAction(action) {
+    const task=this.actionChain.then(action);
+    this.actionChain=task.catch(()=>{});return task;
+  }
+  handle(update) {return this.enqueueAction(()=>this.handleUpdate(update));}
+  async handleUpdate(update) {
+    if (update.callback_query) return this.callbackAction(update.callback_query);
     const m=update.message;
     if (!m || !this.authorized(m.from,m.chat)) return;
+    // Preserve the turn seen when the text arrived, even during worker release.
+    const arrivingActive=this.active;
     await this.waitForRelease();
 
     // Handle photo messages
@@ -173,10 +355,18 @@ export class Bridge {
     try {
       const text=m.text.trim();
       const match=text.match(/^\/([a-z_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/i);
-      if (!match) { if (text.startsWith('/')) return this.say('未知指令，请用 /help。'); return await this.startTurn(text); }
+      if (!match) {
+        if (text.startsWith('/')) return this.say('未知指令，请用 /help。');
+        if(this.broken) throw new Error('Codex 已断开，请在 Mac 重启程序。');
+        if(arrivingActive) return await this.pendingMessages.offer(text,arrivingActive);
+        return await this.startTurn(text);
+      }
       const cmd=match[1].toLowerCase(), arg=(match[2]||'').trim();
-      if (cmd==='start' || cmd==='help') return this.say(HELP);
-      if (cmd==='status') return this.say(`项目：${this.project.name}\n目录：${this.project.cwd}\n已选择会话：${this.selected?.id || '未选择（查看历史不等于选择）'}\n正在预览：${this.previewed?.id || '无'}\n任务：${this.active ? `运行中（${this.active.turnId||'启动中'}）` : '空闲'}\n待审批：${this.approvals.size}\n待回答：${this.questions.size}\n${this.models.summary(this.selected)}\n${this.approvalSettings.summary(this.active)}\n受限网络白名单：${[...this.networkAllowedDomains].join(', ')||'无'}\n模型设置作用于此 Bot 的后续任务，切换会话后仍有效。\nCodex 连接：${this.connectionStatus()}`);
+      if (cmd==='start' || cmd==='help') return this.say(HELP+HELP_EXTRA);
+      if (cmd==='status') return this.say(`项目：${this.project.name}\n目录：${this.project.cwd}\n已选择会话：${this.selected?.id || '未选择（查看历史不等于选择）'}\n正在预览：${this.previewed?.id || '无'}\n任务：${this.active ? `运行中（${this.active.turnId||'启动中'}）` : '空闲'}\n待审批：${this.approvals.size}\n待回答：${this.questions.size}\n待MCP确认：${this.elicitations.size}\n文字待办：${this.pendingMessages.size}（/pending）\n${this.models.summary(this.selected)}\n${this.approvalSettings.summary(this.active)}\n受限网络白名单：${[...this.networkAllowedDomains].join(', ')||'无'}\n模型设置作用于此 Bot 的后续任务，切换会话后仍有效。\nCodex 连接：${this.connectionStatus()}`);
+      if (cmd==='guide') return this.guide();
+      if (cmd==='pending') return await this.pendingMessages.list();
+      if (cmd==='mcp') return await this.mcp(arg);
       if (this.broken) throw new Error('Codex 已断开，请在 Mac 重启程序。');
       if (cmd==='approval') return arg?await this.offerApprovalMode(arg):await this.approvalMenu();
       if (cmd==='permissions') return await this.permissions();
@@ -194,6 +384,77 @@ export class Bridge {
       if (cmd==='answer') return this.answer(arg);
       return this.say('未知指令，请用 /help。');
     } catch(e) { return this.report(e); }
+  }
+  mcpRecord(key) {
+    const record=this.elicitations.get(key);
+    if(!record || record.active!==this.active || record.expires<=this.now() || this.settled.has(record.msg) || !this.isCurrent(record.params,{allowMissingTurn:true})) return null;
+    return record;
+  }
+  async mcp(arg) {
+    if(!arg) return this.say(this.elicitations.size?`待处理 MCP 请求：\n${[...this.elicitations.keys()].map(key=>`/mcp ${key} — 查看填写方式`).join('\n')}`:'当前没有待处理的 MCP 请求。发送 /guide 查看操作引导。');
+    const expiredKey=arg.split(/\s/,1)[0],expired=this.elicitations.get(expiredKey);
+    if(expired && expired.expires<=this.now()) { await this.expireMcp(expiredKey); throw new Error('MCP 请求已过期，未提交决定。'); }
+    const match=arg.match(/^(\S+)(?:\s+([\s\S]+))?$/),key=match?.[1],input=(match?.[2]||'').trim(),record=this.mcpRecord(key);
+    if(!record) throw new Error('MCP 请求编号无效、已处理或已过期；请点击最新请求中的按钮。');
+    if(!input) return this.say(`用法：/mcp ${key} yes\n/mcp ${key} no\n/mcp ${key} cancel\n复杂表单：/mcp ${key} {"字段名":"值"}`);
+    const normalized=input.toLowerCase();
+    if(normalized==='no') return this.finishMcp(key,'decline',null);
+    if(normalized==='cancel') return this.finishMcp(key,'cancel',null);
+    let content;
+    if(normalized==='yes') {
+      const result=validateMcpContent(record.schemaInfo,{});
+      if(result.error) return this.say(`这项 MCP 请求还需要填写字段。\n${result.error}\n\n请使用：/mcp ${key} {"字段名":"值"}\n不要发送密码、Token 或其他敏感信息。`);
+      content=result.content;
+    } else {
+      if(input.length>8000) throw new Error('MCP 表单 JSON 过长，未提交。');
+      let value; try { value=JSON.parse(input); } catch { throw new Error(`JSON 无效。用法：/mcp ${key} {"字段名":"值"}`); }
+      const result=validateMcpContent(record.schemaInfo,value);
+      if(result.error) throw new Error(`${result.error}\n用法：/mcp ${key} {"字段名":"值"}`);
+      content=result.content;
+    }
+    return this.finishMcp(key,'accept',content);
+  }
+  async finishMcp(key,action,content) {
+    const record=this.mcpRecord(key);
+    if(!record) throw new Error('MCP 请求编号无效、已处理或已过期。');
+    this.elicitations.delete(key); clearTimeout(record.timer);
+    for(const buttonKey of record.buttonKeys||[]) this.buttons.delete(buttonKey);
+    this.reply(record.msg,{action,content:action==='accept' && record.mode!=='url'?(content||{}):null});
+    if(record.messageId) void Promise.resolve().then(()=>this.tg.clear(this.config.chatId,record.messageId)).catch(error=>this.diagnostic('keyboard-clear-failed',error));
+    const label=action==='accept'?'确认已提交，Codex 可以继续当前任务。':action==='cancel'?'已取消这项 MCP 请求；整个任务可能继续，需要中止请发 /stop。':'已拒绝这项 MCP 请求。';
+    return this.say(label);
+  }
+  async renderMcpElicitation(key) {
+    const record=this.elicitations.get(key),p=record?.params||{};
+    if(!record) return;
+    const mode=record.mode;
+    let body=`需要你确认\n\n服务：${safeMcpText(p.serverName||'未命名服务',160)}\n请求说明：${safeMcpText(p.message||'未提供说明',1200)}`;
+    let rows;
+    if(mode==='url') {
+      body+=`\n\nURL：${safeMcpUrl(p.url)}\n请在 Mac 打开服务提供的原始链接并完成操作，再点“已在 Mac 完成”。这里隐藏了链接的查询参数和片段，点按钮本身不会打开网页或完成登录。`;
+      rows=[[{text:'已在 Mac 完成',callback_data:this.button('mcpAccept',{key})},{text:'拒绝',callback_data:this.button('mcpDecline',{key})},{text:'取消此请求',callback_data:this.button('mcpCancel',{key})}]];
+    } else {
+      const info=record.schemaInfo;
+      if(info.fields.length) body+=`\n\n字段：\n${info.fields.map(field=>`• ${field.name}${field.required?'（必填）':''} ${field.type}${field.choices?.length?` · 选项：${field.choices.map(choice=>safeMcpText(JSON.stringify(choice),4000)).join(', ')}`:''}${field.default!==undefined?` · 默认：${safeMcpText(JSON.stringify(field.default),4000)}`:''}${field.description?`\n  ${field.description}`:''}`).join('\n')}`;
+      const defaults=validateMcpContent(info,{});
+      const canAccept=!defaults.error;
+      body+=`\n\n${canAccept?'点击允许后提交上面列出的默认值。':'请按按钮选择，或用 /mcp '+key+' {"字段名":"值"} 填写。'}\n不要在 Telegram 输入密码或 Token。`;
+      const accept={text:canAccept?(info.fields.length?'允许（使用默认值）':'允许本次'):'填写说明',callback_data:this.button(canAccept?'mcpAccept':'mcpHelp',{key})};
+      rows=[[accept,{text:'拒绝',callback_data:this.button('mcpDecline',{key})},{text:'取消此请求',callback_data:this.button('mcpCancel',{key})}]];
+      const field=info.fields.length===1?info.fields[0]:null;
+      const choices=field?.choices || (field?.type==='boolean'?[true,false]:null);
+      if(field && choices?.length && choices.length<=6) rows.unshift(...choices.map(value=>[{text:`${field.name}: ${safeMcpText(String(value),45)}`,callback_data:this.button('mcpValue',{key,content:{[field.name]:value}})}]));
+    }
+    body+=`\n\n请求编号：${key}\n约 ${Math.max(0,Math.ceil((record.expires-this.now())/1000))} 秒内有效；/guide 查看当前操作引导。`;
+    record.buttonKeys=rows.flat().map(button=>button.callback_data.slice(2));
+    if(body.length>12000) throw new Error('MCP 详情过长，已拒绝；请在 Mac 处理。');
+    for(const buttonKey of record.buttonKeys) { const button=this.buttons.get(buttonKey); if(button) button.expires=record.expires; }
+    const message=await this.withButtons(body,rows);
+    record.messageId=message.message_id;
+    if(!this.mcpRecord(key)) {
+      for(const buttonKey of record.buttonKeys) this.buttons.delete(buttonKey);
+      await this.tg.clear(this.config.chatId,record.messageId);
+    }
   }
   button(kind,data) {
     // Bound RAM use; losing old navigation buttons is safe.
@@ -575,7 +836,7 @@ export class Bridge {
         if (this.active?.threadId === id && !this.finished.has(turn.id)) this.active.turnId = turn.id;
         if (taskSettings.model) this.selected.model = taskSettings.model;
         if (taskSettings.effort) this.selected.reasoningEffort = taskSettings.effort;
-        await this.say(`文件已提交：${turn.id}\n📎 ${saved.originalName}\n${this.models.summary(this.selected)}`);
+        if(!this.finished.has(turn.id)) await this.announceTaskStarted(turn.id,`⏳ 文件任务正在执行\n📎 ${saved.originalName}\n${this.models.summary(this.selected)}\n需要审批时会发来按钮；/stop 可请求中止。`);
       } catch (e) {
         if (e.code && this.active?.threadId === id && !this.active.turnId) {
           this.active = null; await this.releaseWorker(id);
@@ -604,7 +865,7 @@ export class Bridge {
       if (this.active?.threadId===id && !this.finished.has(turn.id)) this.active.turnId=turn.id;
       if (taskSettings.model) this.selected.model=taskSettings.model;
       if (taskSettings.effort) this.selected.reasoningEffort=taskSettings.effort;
-      await this.say(`任务已提交：${turn.id}\n${this.models.summary(this.selected)}\n${this.approvalSettings.summary(this.active)}\n需要 Codex 审批时会发来按钮；/stop 可请求中止。`);
+      if(!this.finished.has(turn.id)) await this.announceTaskStarted(turn.id,`⏳ Codex 正在执行\n${this.models.summary(this.selected)}\n${this.approvalSettings.summary(this.active)}\n需要审批时会发来按钮；/stop 可请求中止。`);
     } catch(e) {
       // Do not clear an uncertain start: fail closed until explicit stop/restart.
       if (e.code && this.active?.threadId===id && !this.active.turnId) {
@@ -622,7 +883,8 @@ export class Bridge {
     await this.rpc.call('turn/interrupt',{threadId,turnId});
     return this.say('中止请求已提交，等待 Codex 确认。已经完成的文件修改或外部操作不会回滚。');
   }
-  async callback(q) {
+  callback(q) {return this.enqueueAction(()=>this.callbackAction(q));}
+  async callbackAction(q) {
     if (!this.authorized(q.from,q.message?.chat)) { try { await this.tg.ack(q.id,'无权操作'); } catch {} return; }
     try {
       // Spinner acknowledgement is independent from action authorization. A
@@ -630,11 +892,18 @@ export class Bridge {
       Promise.resolve().then(()=>this.tg.ack(q.id)).catch(e=>this.diagnostic('callback-ack-failed',e));
       await this.waitForRelease();
       const data=String(q.data||'');
+      if (data.startsWith('p:')) return await this.pendingMessages.decide(q,data);
       if (data.startsWith('a:')) return await this.decide(q,data);
       if (data.startsWith('d:')) return await this.pendingDirectoryOffer(q,data.slice(2));
       const key=data.startsWith('b:')?data.slice(2):''; const record=this.buttons.get(key);
       if (!record || record.expires<=this.now() || record.messageId!==q.message.message_id) return this.say('按钮已失效，请重新发送指令。');
       const navigation=['history','resumeOffer','page','modelPage','effortMenu'].includes(record.kind);
+      // MCP help/validation must not consume or clear the other choices.
+      if(record.kind==='mcpAccept') return await this.mcp(`${record.data.key} yes`);
+      if(record.kind==='mcpDecline') return await this.mcp(`${record.data.key} no`);
+      if(record.kind==='mcpCancel') return await this.mcp(`${record.data.key} cancel`);
+      if(record.kind==='mcpHelp') return await this.mcp(record.data.key);
+      if(record.kind==='mcpValue') return await this.mcp(`${record.data.key} ${JSON.stringify(record.data.content)}`);
       if (!navigation) {
         if(record.kind==='grantConfirm' && record.data.requestKey) this.requirePendingApproval(record.data.requestKey);
         else if(!['grantCancel','approvalCancel'].includes(record.kind)) this.requireIdle();
@@ -666,8 +935,11 @@ export class Bridge {
       }
     } catch(e) { return this.report(e); }
   }
-  isCurrent(params) {
-    return !this.broken && this.active && !this.active.stopping && typeof params.turnId==='string' && params.threadId===this.active.threadId && (!this.active.turnId || params.turnId===this.active.turnId) && !this.finished.has(params.turnId);
+  isCurrent(params,{allowMissingTurn=false}={}) {
+    if(this.broken || !this.active || this.active.stopping || params?.threadId!==this.active.threadId) return false;
+    const turnId=params?.turnId;
+    if(allowMissingTurn && (turnId===undefined || turnId===null)) return !this.finished.has(this.active.turnId);
+    return typeof turnId==='string' && (!this.active.turnId || turnId===this.active.turnId) && !this.finished.has(turnId);
   }
   reply(msg,result) {
     if (this.settled.has(msg)) return;
@@ -679,6 +951,7 @@ export class Bridge {
     if ([CMD,FILE].includes(msg.method)) this.reply(msg,{decision:'decline'});
     else if (msg.method===PERMISSION) this.reply(msg,{permissions:{},scope:'turn'});
     else if (msg.method===INPUT) this.reply(msg,{answers:{}});
+    else if (msg.method===MCP) this.reply(msg,{action:'decline',content:null});
     else this.reply(msg);
   }
   allowedNetworkAmendment(params) {
@@ -690,11 +963,12 @@ export class Bridge {
     return amendment?{host,action:'allow'}:null;
   }
   async serverRequest(msg) {
+    if(this.requestGeneration!==this.rpc.generation) { this.requests.clear(); this.requestGeneration=this.rpc.generation; }
     if (this.requests.has(msg.id)) return;
     if (this.requests.size>=10000) { this.rpc.fail(new Error('本次连接的交互请求已达上限，请在 Mac 重启。')); return; }
     this.requests.set(msg.id,msg);
     const p=msg.params||{};
-    if (!this.isCurrent(p)) { this.deny(msg); return; }
+    if (!this.isCurrent(p,{allowMissingTurn:msg.method===MCP})) { this.deny(msg); return; }
     if (!this.active.turnId && p.turnId) this.active.turnId=p.turnId;
     if (msg.method===CMD) {
       const amendment=this.allowedNetworkAmendment(p);
@@ -704,6 +978,7 @@ export class Bridge {
       }
     }
     if (msg.method===INPUT) return this.askInput(msg);
+    if (msg.method===MCP) return this.askMcp(msg);
     if (![CMD,FILE].includes(msg.method)) {
       this.deny(msg); await this.say(`Codex 请求了暂未支持的交互（${msg.method}），已拒绝；未授予额外权限。`); return;
     }
@@ -757,6 +1032,39 @@ export class Bridge {
     if (r.messageId) await this.tg.clear(this.config.chatId,r.messageId);
     try { await this.say('一项审批已超时或失效，未允许执行。'); } catch {}
   }
+  async askMcp(msg) {
+    const p=msg.params||{},mode=p.mode;
+    const detail=JSON.stringify(p);
+    if(detail.length>12000 || /[\u202a-\u202e\u2066-\u2069]/u.test(detail) || typeof p.message!=='string' && p.message!==undefined || (p.message?.length||0)>1200 || (p.serverName?.length||0)>160) {
+      this.deny(msg); return this.say('MCP 请求详情无法完整安全展示，已拒绝。请在 Mac 核对；/guide 查看操作引导。');
+    }
+    if(!['form','openai/form','openaiForm','url'].includes(mode)) {
+      this.deny(msg); return this.say('Codex 请求了不受支持的 MCP 交互模式，已拒绝；未授予任何权限。');
+    }
+    let schemaInfo={fields:[],additionalProperties:false};
+    if(mode!=='url') schemaInfo=mcpSchemaInfo(p.requestedSchema);
+    if(schemaInfo.error) {this.deny(msg);return this.say(`MCP 表单未转发：${schemaInfo.error}\n本请求已拒绝；/guide 查看下一步。`);}
+    if(mode==='url' && !safeMcpUrl(p.url).startsWith('http')) {
+      this.deny(msg); return this.say('MCP URL 请求缺少有效 HTTP/HTTPS 地址，已拒绝；请在 Mac 检查。');
+    }
+    const key=nonce(),record={msg,params:p,active:this.active,mode,schemaInfo,expires:this.now()+this.config.approvalTimeoutSeconds*1000,messageId:null,timer:null,buttonKeys:[]};
+    this.elicitations.set(key,record);
+    record.timer=setTimeout(()=>{ void this.expireMcp(key).catch(error=>this.diagnostic('mcp-expiry-failed',error)); },this.config.approvalTimeoutSeconds*1000); record.timer.unref?.();
+    try { await this.renderMcpElicitation(key); }
+    catch(error) {
+      if(this.elicitations.delete(key)) {clearTimeout(record.timer);this.deny(msg);}
+      for(const buttonKey of record.buttonKeys) this.buttons.delete(buttonKey);
+      throw error;
+    }
+  }
+  async expireMcp(key) {
+    const record=this.elicitations.get(key); if(!record) return;
+    this.elicitations.delete(key); clearTimeout(record.timer);
+    try { this.deny(record.msg); } catch {}
+    for(const buttonKey of record.buttonKeys||[]) this.buttons.delete(buttonKey);
+    if(record.messageId) await this.tg.clear(this.config.chatId,record.messageId);
+    try { await this.say(`MCP 请求 ${key} 已超时，未允许网页或外部服务继续。`); } catch {}
+  }
   async askInput(msg) {
     const questions=msg.params.questions;
     if (!Array.isArray(questions) || !questions.length || questions.length>10 || questions.some(q=>!q || q.isSecret || typeof q.id!=='string' || !q.id || typeof q.question!=='string') || new Set(questions.map(q=>q.id)).size!==questions.length) {
@@ -806,16 +1114,31 @@ export class Bridge {
     const groups=new Set();
     for (const [key,r] of this.questions) if (r.group.msg.params.threadId===threadId && r.group.msg.params.turnId===turnId) { groups.add(r.group); this.questions.delete(key); }
     for (const group of groups) { clearTimeout(group.timer); group.remaining.clear(); if (respond) { try { this.deny(group.msg); } catch {} } else this.settled.add(group.msg); }
+    for(const [key,record] of this.elicitations) {
+      const requestTurn=record.params?.turnId;
+      if(record.params?.threadId!==threadId || requestTurn!==undefined && requestTurn!==null && requestTurn!==turnId) continue;
+      this.elicitations.delete(key); clearTimeout(record.timer);
+      if(respond) { try { this.deny(record.msg); } catch {} } else this.settled.add(record.msg);
+      for(const buttonKey of record.buttonKeys||[]) this.buttons.delete(buttonKey);
+      if(record.messageId) void this.tg.clear(this.config.chatId,record.messageId);
+    }
     for (const key of this.items.keys()) if (key.startsWith(`${threadId}:${turnId}:`)) this.items.delete(key);
   }
   async finishTurn(threadId,turn) {
+    const completedActive=this.active?.threadId===threadId && (!this.active.turnId || this.active.turnId===turn.id)?this.active:null;
+    const pausedPending=this.pendingMessages.completed(completedActive,turn);
     let outputWarning=false;
     try { await this.cleanupStreamingMessage(turn.id); await this.flushFileOutputs(threadId,turn.id); }
     catch(error) { outputWarning=true; this.diagnostic('turn-output-failed',error); }
     this.invalidateTurn(threadId,turn.id);
     if (this.active?.threadId===threadId && (!this.active.turnId || this.active.turnId===turn.id)) this.active=null;
-    try { await this.say(`任务${turn.status==='completed'?'已完成':turn.status==='interrupted'?'已中止':'已结束'}：${turn.id}\n状态：${turn.status}${turn.error?`\n${safeError(turn.error,this.config.token)}`:''}${outputWarning?'\n部分输出未能回传，请在桌面端核对。':''}\n临时 worker 正在释放；完成后桌面端可接手此会话。`); }
-    finally { await this.releaseWorker(threadId); }
+    // Close the writer before claiming that the desktop can take over. A
+    // Telegram delivery failure must never prevent worker release.
+    await this.releaseWorker(threadId);
+    if(pausedPending) await this.say(`当前任务中止或失败，${pausedPending} 条排队消息已暂停。/pending 查看并决定是否发送。`);
+    const successful=turn.status==='completed';
+    const label=successful?'✅ 任务已完成':turn.status==='interrupted'?'⏹️ 任务已中止':'⚠️ 任务已结束';
+    await this.announceTaskFinished(turn,`${label}\n临时 worker 已释放；桌面端现在可以接手此会话。${turn.error?`\n${safeError(turn.error,this.config.token)}`:''}${outputWarning?'\n部分输出未能回传，请在桌面端核对。':''}`,{autoDelete:successful});
   }
   async notification(msg) {
     const p=msg.params||{};
@@ -825,6 +1148,10 @@ export class Bridge {
       const groups=new Set();
       for (const [key,r] of this.questions) if (r.group.msg.id===p.requestId) { groups.add(r.group); this.questions.delete(key); }
       for (const g of groups) { clearTimeout(g.timer); g.remaining.clear(); }
+      for (const [key,r] of this.elicitations) if (r.msg.id===p.requestId) {
+        this.elicitations.delete(key); clearTimeout(r.timer); for(const buttonKey of r.buttonKeys||[]) this.buttons.delete(buttonKey);
+        if(r.messageId) void this.tg.clear(this.config.chatId,r.messageId);
+      }
       return;
     }
     if (!this.managed.has(p.threadId)) return;
@@ -862,22 +1189,29 @@ export class Bridge {
     if (msg.method==='turn/completed') {
       const turn=p.turn; if (!turn?.id) return;
       if (this.finished.has(turn.id)) return;
+      if(!this.active || this.active.threadId!==p.threadId || this.active.turnId && this.active.turnId!==turn.id) return;
       this.finished.add(turn.id); if (this.finished.size>500) this.finished.delete(this.finished.values().next().value);
       const task=this.finishTurn(p.threadId,turn); this.releasePromise=task;
       try { return await task; }
-      finally { if (this.releasePromise===task) this.releasePromise=null; }
+      finally {
+        if (this.releasePromise===task) this.releasePromise=null;
+        void this.enqueueAction(()=>this.pendingMessages.drain()).catch(error=>this.report(error));
+      }
     }
     if (msg.method==='error') return this.say(`Codex 报告错误：${safeError(p.error,this.config.token)}`);
   }
   dispose() {
+    this.pendingMessages.dispose();
     this.clearTakeoverReservation();
     for (const r of this.approvals.values()) clearTimeout(r.timer);
     for (const r of this.questions.values()) clearTimeout(r.group.timer);
+    for (const r of this.elicitations.values()) clearTimeout(r.timer);
     // 清理所有流式消息的节流定时器
     for (const stream of this.streamingMessages.values()) {
       if (stream.throttleTimer) clearTimeout(stream.throttleTimer);
     }
-    this.approvals.clear(); this.questions.clear(); this.buttons.clear(); this.items.clear(); this.streamingMessages.clear(); this.outputFiles.clear(); this.uploadNames.clear();
+    for (const status of this.taskStatusMessages.values()) if(status.timer) clearTimeout(status.timer);
+    this.approvals.clear(); this.questions.clear(); this.elicitations.clear(); this.requests.clear(); this.buttons.clear(); this.items.clear(); this.streamingMessages.clear(); this.taskStatusMessages.clear(); this.outputFiles.clear(); this.uploadNames.clear();
   }
 
   // 流式输出：处理增量文本

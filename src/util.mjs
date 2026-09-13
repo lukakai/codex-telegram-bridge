@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.4';
 export const REFERENCE_COMMIT = '654b0a77d0d2f81aa21f61caf7af4be88fe550bb';
 export const nonce = () => crypto.randomBytes(12).toString('base64url');
 export const expand = p => p === '~' ? os.homedir() : p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : path.resolve(p);

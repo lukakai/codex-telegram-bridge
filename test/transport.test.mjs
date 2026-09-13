@@ -25,6 +25,7 @@ async function connected(t,{timeoutMs=1000}={}) {
 test('Codex handshake is bidirectional JSONL with managed network and no exposed port',async t=>{
   const f=await connected(t);assert.equal(f.invocation[2].shell,false);assert.deepEqual(f.invocation[1],['app-server','--enable','network_proxy','--listen','stdio://']);
   assert.equal(f.invocation[2].env.CODEX_HOME,'/mock/home');assert.equal(f.sent[0].method,'initialize');assert.equal(f.sent[1].method,'initialized');assert.equal(f.sent[0].jsonrpc,undefined);
+  assert.equal(f.sent[0].params.capabilities.mcpServerOpenaiFormElicitation,true);
 });
 test('out-of-order RPC results match their request IDs',async t=>{
   const f=await connected(t);const one=f.rpc.call('thread/read',{threadId:'a'}),two=f.rpc.call('thread/read',{threadId:'b'});
