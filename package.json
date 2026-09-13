@@ -1,0 +1,23 @@
+{
+  "name": "codex-telegram-local-bridge",
+  "version": "0.4.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukakai/codex-telegram-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lukakai/codex-telegram-bridge/issues"
+  },
+  "keywords": ["codex", "telegram", "bridge", "macos"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node main.mjs",
+    "configure": "node main.mjs --configure",
+    "doctor": "node main.mjs --doctor",
+    "test": "node --test test/*.test.mjs"
+  },
+  "description": "Local single-owner Telegram bridge for the Codex app-server protocol on macOS; no third-party dependencies."
+}

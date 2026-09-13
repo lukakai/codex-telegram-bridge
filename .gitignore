@@ -1,0 +1,9 @@
+state/
+.fixture-*/
+test/.fixture-*/
+.DS_Store
+*.log
+.env
+.env.*
+.tg-upload-*/
+output/
